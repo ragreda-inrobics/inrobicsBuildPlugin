@@ -1,0 +1,25 @@
+Okey, una nueva cosa:
+- Cambia el nombre de APK a APK (desarrollo)
+- El funcionamiento es el siguiente:
+- 1º: Renombra la carpeta de assets (inrobics/src/main/assets) y lo renombre a assets_original
+- 2º: Crea o sobreescribe la carpeta temp_assets con el contenido de los assets de todos los bundles, te los apuntaré
+- 3º: Renombra temp_assets a assets
+- 4º: Compila en APK
+- 5º Al terminar o fallar, vuelve a renombrar assets a temp_assets y assets_original a assets
+
+Quiero que haya una especie de checksum para detectar cambios en assets_original o algún bundle para que temp_assets esté como cacheado para que no tarde en volcar todos los archivos cada vez que se compila. Decide cuál es la forma óptima de hacerlo para que tarde lo menos posible.
+De momento los bundles son:
+- audio_assets
+- mediapipe_assets
+-../UnityProject/androidBuildVirtual/UnityDataAssetPack/src/main/assets
+- ../UnityProject/androidBuildVirtual/unityLibrary/src/main/assets
+- Los dos últimos lo mismo pero con Care, y solo para las builds de care
+
+Si por casualidad conoces una forma más sencilla de hacer esto de una dime.
+
+Los de androidBuildVirtual solo para virtual
+Los de androidBuildCare solo para care
+audio_assets para todos menos clinic
+mediapipe_assets para todos.
+
+Adicionalmente, hay un zip en la raíz del proyecto llamado vosk-model-small-es-0.42.zip que descomprime una carpeta con el mismo nombre, esta se aloja en la carpeta de assets inrobics/src/main/assets. Quiero eliminar esa carpeta en todos los sabores excepto en Care, que la descomprimirá en esa carpeta de assets si no existe.
