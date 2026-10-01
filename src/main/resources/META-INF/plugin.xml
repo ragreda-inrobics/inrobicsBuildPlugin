@@ -6,17 +6,11 @@
     <depends>com.intellij.modules.platform</depends>
     <depends>org.jetbrains.plugins.terminal</depends>
     <extensions defaultExtensionNs="com.intellij">
+        <postStartupActivity implementation="UnityDevStartupActivity"/>
+        <notificationGroup id="Inrobics Unity" displayType="BALLOON" isLogByDefault="true"/>
         <toolWindow id="Inrobics Build"
                     anchor="right"
                     factoryClass="BuildInrobicsToolWindowFactory"
                     icon="/icons/InrobicsBuildSidePanel.svg"/>
     </extensions>
-    <actions>
-        <action id="Inrobics.RunBuildAction"
-                class="RunInrobicsAction"
-                text="Run Inrobics Build">
-            <add-to-group group-id="RunToolbarMainActionGroup" anchor="last"/>
-            <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt B"/>
-        </action>
-    </actions>
 </idea-plugin>

@@ -12,11 +12,15 @@ dependencies {
 
     // IntelliJ Platform Gradle Plugin Dependencies Extension - read more: https://plugins.jetbrains.com/docs/intellij/tools-intellij-platform-gradle-plugin-dependencies-extension.html
     intellijPlatform {
-        intellijIdea("2025.3.5")
+        val androidStudioPath = providers.gradleProperty("androidStudioPath").orNull
+        if (androidStudioPath != null) {
+            local(androidStudioPath)
+        } else {
+            intellijIdea("2025.3.5")
+        }
         testFramework(TestFrameworkType.Platform)
 
         // Add plugin dependencies for compilation here:
-        bundledPlugin("org.jetbrains.kotlin")
         bundledPlugin("org.jetbrains.plugins.terminal")
     }
 

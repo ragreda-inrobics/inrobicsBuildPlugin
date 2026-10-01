@@ -28,20 +28,8 @@ class BuildInrobicsToolWindowFactory : ToolWindowFactory {
         // Componentes Visuales
         val flavorCombo = JComboBox(arrayOf("Clinic", "Care", "Virtual", "Educa"))
         flavorCombo.selectedItem = state.flavor // Cargar valor guardado
-        flavorCombo.addItemListener { if (it.stateChange == ItemEvent.SELECTED) state.flavor = it.item as String }
-
-        val buildTypeCombo = JComboBox(arrayOf("Debug", "Release"))
-        buildTypeCombo.selectedItem = state.buildType
-        buildTypeCombo.addItemListener { if (it.stateChange == ItemEvent.SELECTED) state.buildType = it.item as String }
-
-        // Migración: valor guardado antiguo "APK (desarrollo)" → nuevo nombre
-        if (state.outputFormat == "APK (desarrollo)") state.outputFormat = "APK"
-        val outputFormatCombo = JComboBox(arrayOf("Bundle", "APK"))
-        outputFormatCombo.selectedItem = state.outputFormat
-        outputFormatCombo.addItemListener { if (it.stateChange == ItemEvent.SELECTED) state.outputFormat = it.item as String }
 
         val btnValidators = JButton("Ejecutar Validadores 🔍")
-        btnValidators.addActionListener { InrobicsCommandRunner.runValidatorsInTerminal(project) }
 
         val projectPath = project.basePath ?: ""
 
@@ -83,33 +71,41 @@ class BuildInrobicsToolWindowFactory : ToolWindowFactory {
             }
         }
 
-        val btnEjecutar = makeGreenButton("Ejecutar Build 🚀")
-        btnEjecutar.addActionListener {
-            InrobicsCommandRunner.execute(project, state, ::appendLog)
+        val validatorsStatus = JLabel()
+        fun refreshValidatorsStatus() {
+            validatorsStatus.text = if (state.lastValidatorsTime.isEmpty()) "Sin ejecuciones de validadores"
+                else "Última ejecución: ${state.lastValidatorsTime} · ${if (state.lastValidatorsPassed) "PASÓ" else "FALLÓ"}"
+            validatorsStatus.foreground = if (state.lastValidatorsTime.isEmpty()) UIManager.getColor("Label.foreground")
+                else if (state.lastValidatorsPassed) java.awt.Color(0x388E3C) else java.awt.Color(0xE53935)
+        }
+        fun recordValidatorsResult(passed: Boolean, time: String) {
+            state.lastValidatorsTime = time
+            state.lastValidatorsPassed = passed
+            refreshValidatorsStatus()
+            appendLog("Validadores: ${if (passed) "PASÓ" else "FALLÓ"} · $time")
+        }
+        refreshValidatorsStatus()
+        btnValidators.addActionListener {
+            InrobicsCommandRunner.runValidatorsInTerminal(project, ::recordValidatorsResult)
         }
 
         // -- Sección: Signed Release --
         fun makeVersionText(v: InrobicsVersionManager.VersionInfo?) =
             if (v != null) "Versión: ${v.name}  (code ${v.code})" else "Versión: no detectada"
 
-        val currentVersion = InrobicsVersionManager.readVersion(projectPath)
-        val versionLabel = JLabel(makeVersionText(currentVersion)).apply {
-            toolTipText = InrobicsVersionManager.resolveManifestPath(projectPath)
-                ?.let { "Leyendo de: $projectPath/$it" }
-                ?: "AndroidManifest no encontrado en rutas conocidas (projectPath=$projectPath)"
+        val currentVersion = InrobicsVersionManager.readVersion(projectPath, state.flavor)
+        val versionLabel = JLabel(makeVersionText(currentVersion))
+        fun refreshVersion() {
+            versionLabel.text = makeVersionText(InrobicsVersionManager.readVersion(projectPath, state.flavor))
+            versionLabel.toolTipText = InrobicsVersionManager.resolveVersionPath(projectPath, state.flavor)
+                ?.let { "Leyendo de: $it" } ?: "Version no encontrada"
         }
-
-        val refreshBtn = JButton("↺").apply {
-            toolTipText = "Releer versión del AndroidManifest"
+        refreshVersion()
+        val refreshBtn = JButton("\u21ba").apply {
+            toolTipText = "Releer version del flavor seleccionado"
             preferredSize = java.awt.Dimension(36, 24)
         }
-        refreshBtn.addActionListener {
-            val v = InrobicsVersionManager.readVersion(projectPath)
-            versionLabel.text = makeVersionText(v)
-            versionLabel.toolTipText = InrobicsVersionManager.resolveManifestPath(projectPath)
-                ?.let { "Leyendo de: $projectPath/$it" }
-                ?: "AndroidManifest no encontrado (projectPath=$projectPath)"
-        }
+        refreshBtn.addActionListener { refreshVersion() }
 
         val versionPanel = JPanel(java.awt.BorderLayout()).apply {
             isOpaque = false
@@ -117,14 +113,10 @@ class BuildInrobicsToolWindowFactory : ToolWindowFactory {
             add(refreshBtn, java.awt.BorderLayout.EAST)
         }
 
-        // Preview de la versión resultante para sabores no-Clinic (visible solo con auto-increment activo)
-        val nonClinicPreviewLabel = JLabel()
-        nonClinicPreviewLabel.isVisible = false
-
         // -- Panel de versión Clinic (solo visible cuando se selecciona Clinic) --
         val prevClinicRecord = InrobicsVersionManager.loadVersionRecord(projectPath, "clinic")
-        val prevClinicName = prevClinicRecord?.versionName
-            ?: InrobicsVersionManager.readVersion(projectPath)?.name
+        val prevClinicName = InrobicsVersionManager.readVersion(projectPath, "Clinic")?.name
+            ?: prevClinicRecord?.versionName
             ?: ""
         val (prevDate, prevSeq, prevHotfix) = if (prevClinicName.isNotEmpty())
             InrobicsVersionManager.parseClinicVersionName(prevClinicName)
@@ -146,7 +138,7 @@ class BuildInrobicsToolWindowFactory : ToolWindowFactory {
                 dateField.text.trim(), seqField.text.trim(), hotfix
             )
             val newCode = InrobicsVersionManager.computeNextVersionCode(
-                InrobicsVersionManager.readVersion(projectPath)?.code ?: ""
+                InrobicsVersionManager.readVersion(projectPath, "Clinic")?.code ?: ""
             )
             previewLabel.text = "<html>&nbsp;→ <b>$name</b>&nbsp;&nbsp;<small>(code $newCode)</small></html>"
             state.clinicVersionDate = dateField.text.trim()
@@ -204,28 +196,91 @@ class BuildInrobicsToolWindowFactory : ToolWindowFactory {
 
         val autoIncrementCheck = JCheckBox("Auto-increment version al firmar")
         autoIncrementCheck.isSelected = state.isAutoIncrementVersion
-        autoIncrementCheck.addActionListener { state.isAutoIncrementVersion = autoIncrementCheck.isSelected }
 
-        fun updateNonClinicPreview() {
-            val show = autoIncrementCheck.isSelected && !(flavorCombo.selectedItem as? String).equals("Clinic", ignoreCase = true)
-            if (show) {
-                val cur = InrobicsVersionManager.readVersion(projectPath)
-                val nv = cur?.let { InrobicsVersionManager.computeNextVersionNonClinic(it) }
-                nonClinicPreviewLabel.text = if (nv != null)
-                    "<html>&nbsp;→ <b>${nv.name}</b>&nbsp;&nbsp;<small>(code ${nv.code})</small></html>"
-                else "<html>&nbsp;→ <i>no detectada</i></html>"
+        fun selectedDate(): String = when (state.flavor.lowercase()) {
+            "care" -> state.careVersionDate
+            "educa" -> state.educaVersionDate
+            else -> state.virtualVersionDate
+        }
+        val versionDateField = JTextField(selectedDate().ifEmpty { today })
+        val datePreviousLabel = JLabel()
+        val dateFieldLabel = JLabel()
+        val datePreview = JLabel()
+        val dateVersionPanel = JPanel(GridBagLayout()).apply {
+            border = BorderFactory.createTitledBorder("Versi\u00f3n Virtual")
+            isOpaque = false
+        }
+        val vc = GridBagConstraints().apply {
+            fill = GridBagConstraints.HORIZONTAL
+            insets = Insets(2, 4, 2, 4)
+        }
+        vc.gridx = 0; vc.gridy = 0; vc.gridwidth = 2; vc.weightx = 1.0
+        dateVersionPanel.add(datePreviousLabel, vc)
+        vc.gridwidth = 1
+        vc.gridx = 0; vc.gridy = 1; vc.weightx = 0.0
+        dateVersionPanel.add(dateFieldLabel, vc)
+        vc.gridx = 1; vc.weightx = 1.0; dateVersionPanel.add(versionDateField, vc)
+        vc.gridx = 0; vc.gridy = 2; vc.gridwidth = 2; vc.weightx = 1.0
+        dateVersionPanel.add(datePreview, vc)
+
+        fun updateDatePreview() {
+            dateVersionPanel.isVisible = !state.flavor.equals("Clinic", true)
+            dateVersionPanel.border = BorderFactory.createTitledBorder("Versi\u00f3n ${state.flavor}")
+            val date = versionDateField.text.trim()
+            when (state.flavor.lowercase()) {
+                "virtual" -> state.virtualVersionDate = date
+                "care" -> state.careVersionDate = date
+                "educa" -> state.educaVersionDate = date
             }
-            nonClinicPreviewLabel.isVisible = show
+            val current = InrobicsVersionManager.readVersion(projectPath, state.flavor)
+            datePreviousLabel.text = "<html><small>Anterior: <b>${current?.name ?: "\u2014"}</b></small></html>"
+            dateFieldLabel.text = "<html><small>Fecha (${current?.name?.substringBefore('-') ?: "\u2014"} \u2192)</small></html>"
+            val next = current?.let { InrobicsVersionManager.buildVirtualVersion(it,
+                date, state.isAutoIncrementVersion) }
+            datePreview.text = next?.let {
+                "<html>&nbsp;\u2192 <b>${it.name}</b>&nbsp;&nbsp;<small>(code ${it.code})</small></html>"
+            } ?: "Fecha YYYY.MM.DD requerida"
             panel.revalidate()
             panel.repaint()
         }
-        autoIncrementCheck.addActionListener { updateNonClinicPreview() }
-        flavorCombo.addItemListener { if (it.stateChange == ItemEvent.SELECTED) updateNonClinicPreview() }
-        updateNonClinicPreview()
+        val dateListener = object : DocumentListener {
+            override fun insertUpdate(e: DocumentEvent) = updateDatePreview()
+            override fun removeUpdate(e: DocumentEvent) = updateDatePreview()
+            override fun changedUpdate(e: DocumentEvent) = updateDatePreview()
+        }
+        versionDateField.document.addDocumentListener(dateListener)
+        refreshBtn.addActionListener { updateDatePreview() }
+        updateDatePreview()
 
-        val btnSignedBuild = makeGreenButton("Generar Signed Release 🔏")
+        autoIncrementCheck.addActionListener {
+            state.isAutoIncrementVersion = autoIncrementCheck.isSelected
+            updateDatePreview()
+        }
+        flavorCombo.addItemListener {
+            if (it.stateChange == ItemEvent.SELECTED) {
+                state.flavor = it.item as String
+                refreshVersion()
+                versionDateField.text = selectedDate().ifEmpty { today }
+                updateDatePreview()
+            }
+        }
+
+        val btnSignedBuild = makeGreenButton("Generar build firmada 🔏")
         btnSignedBuild.addActionListener {
+            val dateVersion = if (!state.flavor.equals("Clinic", true)) {
+                val current = InrobicsVersionManager.readVersion(projectPath, state.flavor)
+                val next = current?.let { InrobicsVersionManager.buildVirtualVersion(it, versionDateField.text.trim(), state.isAutoIncrementVersion) }
+                if (next == null) {
+                    com.intellij.openapi.ui.Messages.showErrorDialog(project,
+                        "Introduce una fecha YYYY.MM.DD válida y comprueba la versión del flavor.", "Versión ${state.flavor}")
+                    return@addActionListener
+                }
+                Pair(current, next)
+            } else null
             val (validatorsPassed, validatorsOutput) = InrobicsCommandRunner.runValidatorsSync(project)
+            recordValidatorsResult(validatorsPassed, java.time.LocalDateTime.now()
+                .format(java.time.format.DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm:ss")))
+            appendLog(validatorsOutput)
             if (!validatorsPassed) {
                 val textArea = javax.swing.JTextArea(validatorsOutput, 20, 70).apply {
                     isEditable = false
@@ -245,24 +300,27 @@ class BuildInrobicsToolWindowFactory : ToolWindowFactory {
                 )
                 if (choice != 1) return@addActionListener  // 1 = Bypass
             }
-            if (state.isAutoIncrementVersion) {
-                val current = InrobicsVersionManager.readVersion(projectPath)
-                val newVer = if (state.flavor.equals("Clinic", ignoreCase = true)) {
-                    InrobicsVersionManager.buildClinicVersion(
-                        current?.code ?: "", state.clinicVersionDate,
-                        state.clinicVersionSeq, state.clinicVersionHotfix
-                    )
-                } else {
-                    current?.let { InrobicsVersionManager.computeNextVersionNonClinic(it) }
-                }
-                if (newVer != null && current != null) {
-                    InrobicsVersionManager.writeVersion(projectPath, current, newVer)
+            if (state.isAutoIncrementVersion && state.flavor.equals("Clinic", true)) {
+                val current = InrobicsVersionManager.readVersion(projectPath, state.flavor)
+                val newVer = InrobicsVersionManager.buildClinicVersion(
+                    current?.code ?: "", state.clinicVersionDate,
+                    state.clinicVersionSeq, state.clinicVersionHotfix
+                )
+                if (current != null) {
+                    InrobicsVersionManager.writeVersion(projectPath, current, newVer, state.flavor)
                     InrobicsVersionManager.saveVersionRecord(projectPath, state.flavor,
                         InrobicsVersionManager.VersionRecord(newVer.name, newVer.code))
                     versionLabel.text = makeVersionText(newVer)
-                    updateNonClinicPreview()
                     if (clinicVersionPanel.isVisible) updateClinicPreview()
                 }
+            }
+            if (dateVersion != null) {
+                val (current, next) = dateVersion
+                InrobicsVersionManager.writeVersion(projectPath, current, next, state.flavor)
+                InrobicsVersionManager.saveVersionRecord(projectPath, state.flavor,
+                    InrobicsVersionManager.VersionRecord(next.name, next.code))
+                versionLabel.text = makeVersionText(next)
+                updateDatePreview()
             }
             SignedBuildRunner.execute(project, state)
         }
@@ -283,61 +341,38 @@ class BuildInrobicsToolWindowFactory : ToolWindowFactory {
             }
         }
 
-        // Posicionamiento en la cuadrícula (GridBagLayout para que se adapte al ancho del panel)
-        c.gridy = 0; panel.add(JLabel("Flavor:"), c)
-        c.gridy = 1; panel.add(flavorCombo, c)
-
-        c.gridy = 2; panel.add(JLabel("Build Type:"), c)
-        c.gridy = 3; panel.add(buildTypeCombo, c)
-
-        c.gridy = 4; panel.add(JLabel("Output Format:"), c)
-        c.gridy = 5; panel.add(outputFormatCombo, c)
-
-        val profileCheck = JCheckBox("Benchmark tasks (--profile)")
-        profileCheck.isSelected = state.profileBuild
-        profileCheck.addActionListener { state.profileBuild = profileCheck.isSelected }
-        c.gridy = 6; c.insets = Insets(0, 10, 2, 10)
-        panel.add(profileCheck, c)
-
-        c.gridy = 7; c.insets = Insets(5, 10, 5, 10)
-        panel.add(btnValidators, c)
-
-        c.gridy = 8; c.insets = Insets(10, 10, 5, 10)
-        panel.add(btnEjecutar, c)
-
-        c.gridy = 9; c.insets = Insets(15, 10, 5, 10)
-        panel.add(JSeparator(), c)
-
-        c.gridy = 10; c.insets = Insets(5, 10, 2, 10)
-        panel.add(versionPanel, c)
-
-        c.gridy = 11; c.insets = Insets(0, 10, 2, 10)
-        panel.add(nonClinicPreviewLabel, c)
-
-        c.gridy = 12; c.insets = Insets(2, 6, 2, 6)
-        panel.add(clinicVersionPanel, c)
-
-        c.gridy = 13; c.insets = Insets(2, 10, 2, 10)
-        panel.add(autoIncrementCheck, c)
-
-        c.gridy = 15; c.insets = Insets(10, 10, 5, 10)
-        panel.add(btnSignedBuild, c)
-
-        c.gridy = 16; c.insets = Insets(2, 10, 5, 10)
-        panel.add(btnOpenVersions, c)
-
-        c.gridy = 17; c.insets = Insets(10, 10, 2, 10)
-        panel.add(JLabel("Asset log:"), c)
-
-        c.gridy = 18; c.insets = Insets(0, 6, 6, 6)
-        val logScroll = JScrollPane(logArea).apply {
-            border = javax.swing.BorderFactory.createLineBorder(java.awt.Color(0x55, 0x55, 0x55))
-            horizontalScrollBarPolicy = JScrollPane.HORIZONTAL_SCROLLBAR_NEVER
+        val unityPanel = UnityBuildPanel(project, { state.flavor }, ::appendLog)
+        flavorCombo.addItemListener {
+            if (it.stateChange == ItemEvent.SELECTED) {
+                javax.swing.SwingUtilities.invokeLater { unityPanel.refresh() }
+            }
         }
-        panel.add(logScroll, c)
+        // Descargas Unity separadas del flujo de firma.
+        var row = 0
+        fun addRow(component: JComponent) {
+            c.gridy = row++
+            panel.add(component, c)
+        }
+        addRow(unityPanel)
+        addRow(JSeparator())
+        addRow(JLabel("Build firmada"))
+        addRow(JLabel("Flavor:"))
+        addRow(flavorCombo)
+        addRow(versionPanel)
+        addRow(clinicVersionPanel)
+        addRow(dateVersionPanel)
+        addRow(autoIncrementCheck)
+        addRow(btnValidators)
+        addRow(btnSignedBuild)
+        addRow(btnOpenVersions)
+        addRow(JLabel("Validadores:"))
+        addRow(validatorsStatus)
+        addRow(JScrollPane(logArea).apply {
+            horizontalScrollBarPolicy = JScrollPane.HORIZONTAL_SCROLLBAR_NEVER
+        })
 
         // Espaciador invisible al final para empujar todo hacia arriba
-        c.gridy = 20; c.weighty = 1.0; c.insets = Insets(0, 0, 0, 0)
+        c.gridy = row; c.weighty = 1.0; c.insets = Insets(0, 0, 0, 0)
         panel.add(JPanel(), c)
 
         // Añadir el panel al contenedor oficial de la Tool Window (con scroll)

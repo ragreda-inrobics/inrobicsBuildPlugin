@@ -16,6 +16,7 @@ import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.wm.ToolWindowManager
 import com.intellij.util.xmlb.XmlSerializerUtil
 import org.jetbrains.plugins.terminal.TerminalToolWindowManager
+import org.jetbrains.plugins.terminal.ShellTerminalWidget
 import java.awt.GridBagConstraints
 import java.awt.GridBagLayout
 import java.awt.Insets
@@ -38,13 +39,19 @@ private val GRADLE_SYSTEM_ID = ProjectSystemId("GRADLE")
 @Service(Service.Level.PROJECT)
 class InrobicsBuildState : PersistentStateComponent<InrobicsBuildState> {
     var flavor: String = "Clinic"
-    var buildType: String = "Debug"
+    var buildType: String = "Release"
     var outputFormat: String = "Bundle"
     var isAutoIncrementVersion: Boolean = true
     var profileBuild: Boolean = false
     var clinicVersionDate: String = ""
     var clinicVersionSeq: String = ""
     var clinicVersionHotfix: String = "a"
+    var virtualVersionPatch: String = ""
+    var virtualVersionDate: String = ""
+    var careVersionDate: String = ""
+    var educaVersionDate: String = ""
+    var lastValidatorsTime: String = ""
+    var lastValidatorsPassed: Boolean = false
 
     override fun getState(): InrobicsBuildState = this
 
@@ -65,7 +72,8 @@ object InrobicsVersionManager {
     val KEYSTORE_MAP = mapOf(
         "clinic"  to "upload-keystore2.jks",
         "care"    to "upload-keystore-care.jks",
-        "virtual" to "upload-keystore-virtual.jks"
+        "virtual" to "upload-keystore-virtual.jks",
+        "educa"   to "upload-keystore-educa.jks"
     )
 
     data class VersionInfo(val code: String, val name: String)
@@ -83,7 +91,8 @@ object InrobicsVersionManager {
         "src/main/AndroidManifest.xml"
     )
 
-    fun readVersion(projectPath: String): VersionInfo? {
+    fun readVersion(projectPath: String, flavor: String? = null): VersionInfo? {
+        if (flavor != null) FlavorVersionFile.find(projectPath, flavor)?.let { return it.version }
         for (path in CANDIDATE_PATHS) {
             val file = File("$projectPath/$path")
             if (!file.exists()) continue
@@ -94,6 +103,10 @@ object InrobicsVersionManager {
         }
         return null
     }
+
+    fun resolveVersionPath(projectPath: String, flavor: String): String? =
+        FlavorVersionFile.find(projectPath, flavor)?.file?.absolutePath
+            ?: resolveManifestPath(projectPath)?.let { File(projectPath, it).absolutePath }
 
     /** Devuelve el primer AndroidManifest encontrado con versionCode, o null. Útil para mostrar el path al usuario. */
     fun resolveManifestPath(projectPath: String): String? =
@@ -147,6 +160,22 @@ object InrobicsVersionManager {
         return VersionInfo(computeNextVersionCode(current.code), newName)
     }
 
+    /** Cambia únicamente el último componente numérico, conservando versionCode. */
+    fun withVirtualPatch(current: VersionInfo, patch: String): VersionInfo? {
+        if (!Regex("[0-9]+").matches(patch)) return null
+        val match = Regex("^(.+\\.)([0-9]+)$").matchEntire(current.name) ?: return null
+        return current.copy(name = match.groupValues[1] + patch)
+    }
+
+    fun buildVirtualVersion(current: VersionInfo, date: String, autoIncrement: Boolean): VersionInfo? {
+        val validDate = runCatching {
+            java.time.LocalDate.parse(date, DateTimeFormatter.ofPattern("uuuu.MM.dd")
+                .withResolverStyle(java.time.format.ResolverStyle.STRICT))
+        }.isSuccess
+        if (!validDate) return null
+        return VersionInfo(if (autoIncrement) computeNextVersionCode(current.code) else current.code, date)
+    }
+
     /** Parsea el versionName de Clinic en (fecha, release, hotfix). Hotfix 'a' = sin sufijo. */
     fun parseClinicVersionName(versionName: String): Triple<String, String, String> {
         val parts = versionName.split("-", limit = 2)
@@ -166,7 +195,11 @@ object InrobicsVersionManager {
     fun buildClinicVersion(currentCode: String, date: String, seq: String, hotfix: String): VersionInfo =
         VersionInfo(computeNextVersionCode(currentCode), buildClinicVersionName(date, seq, hotfix))
 
-    fun writeVersion(projectPath: String, old: VersionInfo, new: VersionInfo) {
+    fun writeVersion(projectPath: String, old: VersionInfo, new: VersionInfo, flavor: String? = null) {
+        if (flavor != null) FlavorVersionFile.find(projectPath, flavor)?.let {
+            FlavorVersionFile.write(it, new)
+            return
+        }
         val path = resolveManifestPath(projectPath) ?: return
         val file = File("$projectPath/$path")
         val content = file.readText()
@@ -290,7 +323,7 @@ object SignedBuildRunner {
         if (keystoreFile == null) {
             Messages.showErrorDialog(
                 project,
-                "No hay keystore configurado para el flavor '${state.flavor}'.\nFlavors soportados: Clinic, Care, Virtual.",
+                "No hay keystore configurado para el flavor '${state.flavor}'.\nFlavors soportados: Clinic, Care, Virtual, Educa.",
                 "Error de firma"
             )
             return
@@ -309,7 +342,7 @@ object SignedBuildRunner {
         }
         InrobicsVersionManager.writeKeystoreProperties(projectPath, creds)
         val flavor = state.flavor.replaceFirstChar { it.uppercase() }
-        val taskName = if (state.outputFormat == "Bundle") "bundle${flavor}Release" else "assemble${flavor}Release"
+        val taskName = "bundle${flavor}Release"
         val settings = ExternalSystemTaskExecutionSettings().apply {
             externalProjectPath = projectPath
             taskNames = listOf(taskName)
@@ -317,226 +350,6 @@ object SignedBuildRunner {
         }
         ExternalSystemUtil.runTask(settings, DefaultRunExecutor.EXECUTOR_ID, project, GRADLE_SYSTEM_ID)
     }
-}
-
-// 4.5. Gestiona el intercambio de assets antes/después de compilar APK (desarrollo)
-object AssetPreparer {
-    private const val ASSETS_PATH = "inrobics/src/main/assets"
-    private const val ORIG_PATH   = "inrobics/src/main/assets_original"
-    private const val TEMP_PATH   = "inrobics/src/main/temp_assets"
-    private const val FP_FILE     = ".inrobics_fingerprint.json"
-
-    /** Fingerprint rápido: "fileCount:totalBytes:newestMtime" sin leer contenido. */
-    private fun fingerprint(dir: File): String {
-        if (!dir.exists()) return "0:0:0"
-        var n = 0L; var b = 0L; var t = 0L
-        dir.walkTopDown().filter { it.isFile }.forEach {
-            n++; b += it.length(); if (it.lastModified() > t) t = it.lastModified()
-        }
-        return "$n:$b:$t"
-    }
-
-    @Suppress("UNCHECKED_CAST")
-    private fun loadStored(tempDir: File): Map<String, String> = try {
-        val f = File(tempDir, FP_FILE)
-        if (!f.exists()) emptyMap()
-        else Gson().fromJson(f.readText(), Map::class.java) as? Map<String, String> ?: emptyMap()
-    } catch (_: Exception) { emptyMap() }
-
-    private fun saveFingerprints(tempDir: File, fp: Map<String, String>) {
-        File(tempDir, FP_FILE).writeText(Gson().toJson(fp))
-    }
-
-    private const val STATE_FILE = ".inrobics_build_state.json"
-
-    @Suppress("UNCHECKED_CAST")
-    private fun readPreparedState(projectPath: String): Map<String, String>? = try {
-        val f = File("$projectPath/$STATE_FILE")
-        if (!f.exists()) null
-        else Gson().fromJson(f.readText(), Map::class.java) as? Map<String, String>
-    } catch (_: Exception) { null }
-
-    private fun writePreparedState(projectPath: String, fp: Map<String, String>) {
-        File("$projectPath/$STATE_FILE").writeText(Gson().toJson(fp))
-    }
-
-    fun clearPreparedState(projectPath: String) {
-        File("$projectPath/$STATE_FILE").delete()
-    }
-
-    fun isPrepared(projectPath: String): Boolean =
-        File("$projectPath/$STATE_FILE").exists() && File("$projectPath/$ORIG_PATH").exists()
-
-    private fun bundleSources(root: String, flavor: String): LinkedHashMap<String, File> {
-        val map = LinkedHashMap<String, File>()
-        map["mediapipe_assets"] = File("$root/mediapipe_assets/src/main/assets")
-        if (!flavor.equals("clinic", ignoreCase = true))
-            map["audio_assets"] = File("$root/audio_assets/src/main/assets")
-        if (flavor.equals("virtual", ignoreCase = true)) {
-            map["unity_v_data"] = File("$root/../UnityProject/androidBuildVirtual/UnityDataAssetPack/src/main/assets")
-            map["unity_v_lib"]  = File("$root/../UnityProject/androidBuildVirtual/unityLibrary/src/main/assets")
-        }
-        if (flavor.equals("care", ignoreCase = true)) {
-            map["unity_c_data"] = File("$root/../UnityProject/androidBuildCare/UnityDataAssetPack/src/main/assets")
-            map["unity_c_lib"]  = File("$root/../UnityProject/androidBuildCare/unityLibrary/src/main/assets")
-            map["vosk_assets"]  = File("$root/vosk_assets/src/main/assets")
-        }
-        return map
-    }
-
-    /**
-     * Prepara los assets antes de compilar.
-     * @return null si OK, mensaje de error si falla.
-     */
-    fun prepare(
-        projectPath: String,
-        flavor: String,
-        buildType: String,
-        indicator: com.intellij.openapi.progress.ProgressIndicator?,
-        log: ((String) -> Unit)? = null
-    ): String? {
-        val t0 = System.currentTimeMillis()
-        var tLast = t0
-        fun step(msg: String) {
-            val now = System.currentTimeMillis()
-            val delta = now - tLast; tLast = now
-            val total = now - t0
-            val tag = if (delta > 50) " [+${delta}ms / ${total}ms]" else ""
-            indicator?.text = msg
-            log?.invoke("$msg$tag")
-        }
-        val assetsDir = File("$projectPath/$ASSETS_PATH")
-        val origDir   = File("$projectPath/$ORIG_PATH")
-        val tempDir   = File("$projectPath/$TEMP_PATH")
-
-        // Verificar si assets ya están preparados para este flavor/buildType/fuentes
-        val storedState = readPreparedState(projectPath)
-        if (storedState != null && origDir.exists()) {
-            val sources = bundleSources(projectPath, flavor)
-            val checkKeys = LinkedHashMap<String, File>().also { it["assets_original"] = origDir; it.putAll(sources) }
-            val currentFp = LinkedHashMap(checkKeys.mapValues { (_, d) -> fingerprint(d) }).also {
-                it["__config__"] = "${flavor.lowercase()}|${buildType.lowercase()}"
-            }
-            if (currentFp == storedState) {
-                step("⚡ Assets ya preparados para ${flavor}/${buildType}, skip swap")
-                return null  // Gradle no ve cambios → UP-TO-DATE garantizado
-            } else {
-                if (storedState["__config__"] != currentFp["__config__"])
-                    step("🔄 Config cambiada (${storedState["__config__"]} → ${currentFp["__config__"]}), restaurando...")
-                else
-                    step("🔄 Fuentes modificadas, restaurando assets...")
-                clearPreparedState(projectPath)
-                if (assetsDir.exists()) { tempDir.deleteRecursively(); assetsDir.renameTo(tempDir) }
-                if (!origDir.renameTo(assetsDir))
-                    return "No se pudo restaurar assets_original → assets."
-            }
-        } else if (storedState != null && !origDir.exists()) {
-            clearPreparedState(projectPath)  // state file huérfano
-        }
-
-        // Recovery: estado inconsistente de build anterior interrumpida
-        if (origDir.exists()) {
-            step("⚠️ Recovery: assets_original encontrado, restaurando estado previo...")
-            if (assetsDir.exists()) {
-                if (!tempDir.exists()) assetsDir.renameTo(tempDir)
-                else assetsDir.deleteRecursively()
-            }
-            if (!origDir.renameTo(assetsDir))
-                return "No se pudo recuperar assets. Renombra manualmente assets_original → assets."
-        }
-
-        // Step 1: assets → assets_original
-        step("📂 assets → assets_original")
-        if (assetsDir.exists() && !assetsDir.renameTo(origDir))
-            return "No se pudo renombrar 'assets' → 'assets_original'."
-
-        return try {
-            val sources = bundleSources(projectPath, flavor)
-            val allKeys = LinkedHashMap<String, File>().also { it["assets_original"] = origDir; it.putAll(sources) }
-
-            step("🔍 Calculando cambios en assets...")
-            val current = LinkedHashMap(allKeys.mapValues { (_, d) -> fingerprint(d) }).also {
-                it["__config__"] = "${flavor.lowercase()}|${buildType.lowercase()}"
-            }
-            val stored  = loadStored(tempDir)
-            val needsRebuild = (current != stored) || !tempDir.exists()
-            if (needsRebuild && stored["__config__"] != null && stored["__config__"] != current["__config__"])
-                step("🔄 Cambio de configuración detectado (${stored["__config__"]} → ${current["__config__"]}), reconstruyendo...")
-
-            if (needsRebuild) {
-                step("🛠️ Construyendo temp_assets (sin caché)...")
-                tempDir.deleteRecursively()
-                tempDir.mkdirs()
-
-                // Copiar assets_original
-                if (origDir.exists()) {
-                    val count = origDir.walkTopDown().count { it.isFile }
-                    step("📄 Copiando assets_original ($count ficheros)...")
-                    origDir.walkTopDown().filter { it.isFile }.forEach { src ->
-                        val rel = src.relativeTo(origDir).path.replace('\\', '/')
-                        val dest = File(tempDir, rel)
-                        dest.parentFile?.mkdirs()
-                        src.copyTo(dest, overwrite = true)
-                    }
-                }
-
-                // Copiar bundles
-                sources.entries.forEachIndexed { i, (key, srcDir) ->
-                    if (srcDir.exists()) {
-                        val count = srcDir.walkTopDown().count { it.isFile }
-                        step("📄 Copiando $key ($count ficheros) [${i + 1}/${sources.size}]...")
-                        srcDir.walkTopDown().filter { it.isFile }.forEach { src ->
-                            val dest = File(tempDir, src.relativeTo(srcDir).path)
-                            dest.parentFile?.mkdirs()
-                            src.copyTo(dest, overwrite = true)
-                        }
-                    } else {
-                        step("⚠️ $key no encontrado: ${srcDir.absolutePath}")
-                    }
-                }
-
-                saveFingerprints(tempDir, current)
-                step("✅ temp_assets construido")
-            } else {
-                step("⚡ Assets en caché ✓")
-            }
-
-            // Step 3: temp_assets → assets
-            step("📂 temp_assets → assets")
-            if (!tempDir.renameTo(assetsDir)) {
-                origDir.renameTo(assetsDir) // best-effort restore
-                return "No se pudo renombrar 'temp_assets' → 'assets'."
-            }
-            writePreparedState(projectPath, current)
-            step("✅ Assets listos para la build")
-            null
-        } catch (e: Exception) {
-            step("❌ Error: ${e.message}")
-            clearPreparedState(projectPath)
-            try { assetsDir.deleteRecursively(); origDir.renameTo(assetsDir) } catch (_: Exception) {}
-            "Error preparando assets: ${e.message}"
-        }
-    }
-
-    /** Restaura assets originales y guarda temp_assets para caché en la próxima build. */
-    fun restore(projectPath: String, log: ((String) -> Unit)? = null) {
-        clearPreparedState(projectPath)
-        val assetsDir = File("$projectPath/$ASSETS_PATH")
-        val origDir   = File("$projectPath/$ORIG_PATH")
-        val tempDir   = File("$projectPath/$TEMP_PATH")
-        if (assetsDir.exists()) {
-            log?.invoke("📂 assets → temp_assets (caché)")
-            tempDir.deleteRecursively()
-            assetsDir.renameTo(tempDir)
-        }
-        if (origDir.exists()) {
-            log?.invoke("📂 assets_original → assets")
-            origDir.renameTo(assetsDir)
-        }
-        log?.invoke("✅ Assets restaurados")
-    }
-
-
 }
 
 // 5. Este objeto centraliza la ejecución para no repetir código
@@ -552,35 +365,12 @@ object InrobicsCommandRunner {
 
         val isApkMode = state.outputFormat != "Bundle"
 
-        // Para builds de Bundle o APK: restaurar si los assets están en estado preparado (de APK desarrollo anterior)
-        if (state.outputFormat != "APK (desarrollo)" && AssetPreparer.isPrepared(basePath)) {
-            log?.invoke("📂 Restaurando assets originales para build de Bundle...")
-            AssetPreparer.restore(basePath, log)
-        }
-
-        // Preparar assets solo en modo APK (desarrollo)
-        if (state.outputFormat == "APK (desarrollo)") {
-            var prepareError: String? = null
-            val pm = com.intellij.openapi.progress.ProgressManager.getInstance()
-            val prepareStart = System.currentTimeMillis()
-            pm.runProcessWithProgressSynchronously({
-                prepareError = AssetPreparer.prepare(basePath, state.flavor, state.buildType, pm.progressIndicator, log)
-            }, "Preparando assets…", false, project)
-            log?.invoke("⏱️ Prepare total: ${System.currentTimeMillis() - prepareStart}ms")
-
-            if (prepareError != null) {
-                log?.invoke("❌ Error: $prepareError")
-                Messages.showErrorDialog(project, prepareError!!, "Error preparando assets")
-                return
-            }
-        }
-
         val settings = ExternalSystemTaskExecutionSettings().apply {
             externalProjectPath = basePath
             taskNames = if (!isApkMode)
                 listOf("bundle${flavor}${buildType}", "assemble${flavor}${buildType}")
             else
-                listOf("assemble${flavor}${buildType}")  // solo build; install gestionado por el plugin
+                listOf("assemble${flavor}${buildType}")  // Solo compilar el APK
             if (state.profileBuild) scriptParameters = "--profile"
             externalSystemIdString = GRADLE_SYSTEM_ID.id
         }
@@ -710,52 +500,7 @@ object InrobicsCommandRunner {
                     return
                 }
 
-                com.intellij.openapi.application.ApplicationManager.getApplication().invokeLater {
-                    val serial = resolveAdbSerial()
-                    log?.invoke("📱 Serial ADB: ${serial ?: "(default/ninguno)"}")
-
-                    // APK mode: buscar APK e instalar
-                    val apkDir = java.io.File("$basePath/inrobics/build/outputs/apk/${state.flavor.lowercase()}/${state.buildType.lowercase()}")
-                    log?.invoke("📂 Buscando APK en: ${apkDir.path}")
-                    val apkFile = apkDir.listFiles { f -> f.extension == "apk" }?.firstOrNull()
-                    if (apkFile != null) {
-                        val lastInstalled = readLastInstallTime(basePath)
-                        if (apkFile.lastModified() != lastInstalled) {
-                            val sizeMb = apkFile.length() / 1024 / 1024
-                            log?.invoke("📦 APK cambiado, instalando ($sizeMb MB)...")
-                            val installArgs = buildList {
-                                add(adbPath())
-                                if (serial != null) { add("-s"); add(serial) }
-                                addAll(listOf("install", "-r", apkFile.absolutePath))
-                            }
-                            com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
-                                if (adbInstallWithRetry(project, packageName, serial, installArgs, log)) {
-                                    writeLastInstallTime(basePath, apkFile.lastModified())
-                                    runProcess(buildList {
-                                        add(adbPath())
-                                        if (serial != null) { add("-s"); add(serial) }
-                                        addAll(listOf("shell", "monkey", "-p", packageName, "-c", "android.intent.category.LAUNCHER", "1"))
-                                    }, log)
-                                    log?.invoke("🚀 App lanzada")
-                                }
-                            }
-                            return@invokeLater
-                        } else {
-                            log?.invoke("⚡ APK sin cambios desde último install, skip")
-                        }
-                    } else {
-                        log?.invoke("⚠️ No se encontró APK en ${apkDir.path}")
-                    }
-
-                    com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
-                        runProcess(buildList {
-                            add(adbPath())
-                            if (serial != null) { add("-s"); add(serial) }
-                            addAll(listOf("shell", "monkey", "-p", packageName, "-c", "android.intent.category.LAUNCHER", "1"))
-                        }, log)
-                        log?.invoke("🚀 App lanzada")
-                    }
-                }
+                log?.invoke("APK generado; build completada")
             }
             override fun onFailure() {
                 log?.invoke("❌ Build fallida")
@@ -773,19 +518,7 @@ object InrobicsCommandRunner {
         )
     }
 
-    /**
-     * Ejecuta `adb devices` y devuelve el serial del dispositivo conectado.
-     * - 1 dispositivo → devuelve su serial (se usará -s <serial>)
-     * - 0 o >1 dispositivos → devuelve null (adb decide por defecto / falla con error explicativo)
-     */
-    private fun readLastInstallTime(projectPath: String): Long = try {
-        java.io.File("$projectPath/.inrobics_last_install").readText().trim().toLong()
-    } catch (_: Exception) { 0L }
-
-    private fun writeLastInstallTime(projectPath: String, time: Long) {
-        java.io.File("$projectPath/.inrobics_last_install").writeText(time.toString())
-    }
-
+    /** Devuelve el serial cuando hay exactamente un dispositivo ADB conectado. */
     private fun resolveAdbSerial(): String? = try {
         val proc = ProcessBuilder(adbPath(), "devices").start()
         val lines = proc.inputStream.bufferedReader().readLines()
@@ -797,19 +530,6 @@ object InrobicsCommandRunner {
             .filter { it.isNotBlank() }
         if (devices.size == 1) devices.first() else null
     } catch (_: Exception) { null }
-
-    private fun openTerminalAndRun(project: Project, workDir: String?, command: String, title: String) {
-        val terminalToolWindow = ToolWindowManager.getInstance(project).getToolWindow("Terminal")
-        terminalToolWindow?.show {
-            try {
-                @Suppress("DEPRECATION", "removal")
-                val widget = TerminalToolWindowManager.getInstance(project)
-                    .createLocalShellWidget(workDir, title)
-                @Suppress("DEPRECATION", "removal")
-                widget.executeCommand(command)
-            } catch (ex: Exception) { ex.printStackTrace() }
-        }
-    }
 
     private fun adbPath(): String {
         val sdkHome = System.getenv("ANDROID_HOME")
@@ -832,68 +552,73 @@ object InrobicsCommandRunner {
         }
     }
 
-    private fun adbInstallWithRetry(
-        project: Project,
-        packageName: String,
-        serial: String?,
-        installArgs: List<String>,
-        log: ((String) -> Unit)?
-    ): Boolean {
-        val t0 = System.currentTimeMillis()
-        val (exit, output) = runProcess(installArgs)
-        log?.invoke("⏱️ adb install: ${"%.1f".format((System.currentTimeMillis() - t0) / 1000.0)}s")
-
-        if (exit == 0 && !output.contains("Failure [")) {
-            log?.invoke("✅ Instalada correctamente")
-            return true
+    /** Abre una sesión independiente sin usar la ruta de shell configurada en el IDE. */
+    fun runValidatorsInTerminal(project: Project, onResult: (Boolean, String) -> Unit) {
+        val basePath = project.basePath ?: return
+        val toolWindow = ToolWindowManager.getInstance(project).getToolWindow("Terminal")
+        if (toolWindow == null) {
+            Messages.showErrorDialog(project, "La ventana Terminal no está disponible.", "Validadores")
+            return
         }
-
-        val isVersionError = output.contains("INSTALL_FAILED_VERSION_DOWNGRADE") ||
-                             output.contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE")
-        if (isVersionError) {
-            log?.invoke("⚠️ Versión incompatible detectada")
-            val latch = java.util.concurrent.CountDownLatch(1)
-            var doUninstall = false
-            com.intellij.openapi.application.ApplicationManager.getApplication().invokeLater {
-                doUninstall = Messages.showOkCancelDialog(
-                    project,
-                    "La versión instalada en el dispositivo es incompatible con esta build.\n\n" +
-                    "¿Desinstalar la app del dispositivo e instalar de nuevo?",
-                    "Versión incompatible",
-                    "Desinstalar e instalar",
-                    "Cancelar",
-                    Messages.getWarningIcon()
-                ) == Messages.OK
-                latch.countDown()
-            }
-            latch.await()
-            if (doUninstall) {
-                val uninstallArgs = buildList {
-                    add(adbPath())
-                    if (serial != null) { add("-s"); add(serial) }
-                    addAll(listOf("uninstall", packageName))
+        toolWindow.show {
+            var sessionDirectory: File? = null
+            try {
+                val directory = java.nio.file.Files.createTempDirectory("inrobics-validators-").toFile()
+                sessionDirectory = directory
+                val resultFile = File(directory, "result.json")
+                val wrapper = File(directory, "run.py")
+                wrapper.writeText("""
+                    import datetime, json, pathlib, subprocess, sys, traceback
+                    code = 1
+                    try:
+                        code = subprocess.call([sys.executable, '-X', 'utf8', 'buildInrobics.py', '--run_validators'])
+                    except Exception:
+                        traceback.print_exc()
+                    finally:
+                        destination = pathlib.Path(__file__).with_name('result.json')
+                        temporary = destination.with_suffix('.tmp')
+                        temporary.write_text(json.dumps({'passed': code == 0, 'time': datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')}), encoding='utf-8')
+                        temporary.replace(destination)
+                    sys.exit(code)
+                """.trimIndent(), Charsets.UTF_8)
+                val windows = System.getProperty("os.name").lowercase().contains("win")
+                val shell = if (windows) {
+                    val cmd = System.getenv("ComSpec")
+                        ?: File(System.getenv("SystemRoot") ?: "C:\\Windows", "System32/cmd.exe").absolutePath
+                    listOf(cmd, "/d", "/k", "chcp 65001 >nul")
+                } else listOf("/bin/sh", "-i")
+                val widget = TerminalToolWindowManager.getInstance(project)
+                    .createNewSession(basePath, "Inrobics Validators", shell, true, true)
+                val scriptPath = if (windows) "\"${wrapper.absolutePath}\""
+                    else "'${wrapper.absolutePath.replace("'", "'\\''")}'"
+                val command = if (windows)
+                    "set \"PYTHONUTF8=1\" && set \"PYTHONIOENCODING=utf-8\" && python -X utf8 $scriptPath"
+                else "PYTHONUTF8=1 PYTHONIOENCODING=utf-8 python -X utf8 $scriptPath"
+                @Suppress("DEPRECATION", "removal")
+                ShellTerminalWidget.toShellJediTermWidgetOrThrow(widget).executeCommand(command)
+                val started = System.currentTimeMillis()
+                val timer = javax.swing.Timer(500, null)
+                timer.addActionListener {
+                    if (project.isDisposed || System.currentTimeMillis() - started > 24 * 60 * 60 * 1000L) {
+                        timer.stop()
+                        directory.deleteRecursively()
+                    } else if (resultFile.exists()) {
+                        timer.stop()
+                        try {
+                            val result = Gson().fromJson(resultFile.readText(Charsets.UTF_8), JsonObject::class.java)
+                            onResult(result.get("passed").asBoolean, result.get("time").asString)
+                        } finally {
+                            directory.deleteRecursively()
+                        }
+                    }
                 }
-                log?.invoke("🗑️ Desinstalando $packageName...")
-                val (_, uninstallOut) = runProcess(uninstallArgs)
-                log?.invoke(uninstallOut.trim())
-                log?.invoke("🔄 Reintentando instalación...")
-                val (retryExit, retryOut) = runProcess(installArgs)
-                if (retryExit == 0 && !retryOut.contains("Failure [")) {
-                    log?.invoke("✅ Instalada correctamente")
-                    return true
-                }
-                log?.invoke("❌ Error al reinstalar: $retryOut")
-                return false
+                timer.start()
+            } catch (ex: Exception) {
+                sessionDirectory?.deleteRecursively()
+                onResult(false, LocalDateTime.now().format(DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm:ss")))
+                Messages.showErrorDialog(project, "No se pudo abrir la terminal: ${ex.message}", "Validadores")
             }
-        } else {
-            log?.invoke("❌ Error de instalación: $output")
         }
-        return false
-    }
-
-    /** Corre los validadores en una pestaña de terminal (async, sin bloquear). */
-    fun runValidatorsInTerminal(project: Project) {
-        openTerminalAndRun(project, project.basePath, "python buildInrobics.py --run_validators", "Inrobics Validators")
     }
 
     /** Corre los validadores de forma síncrona con diálogo de progreso. Devuelve (pasó, output). */
@@ -905,16 +630,16 @@ object InrobicsCommandRunner {
             .runProcessWithProgressSynchronously(
                 {
                     try {
-                        val isWindows = System.getProperty("os.name").lowercase().contains("win")
-                        val cmd = if (isWindows)
-                            listOf("cmd", "/c", "python", "buildInrobics.py", "--run_validators")
-                        else
-                            listOf("python", "buildInrobics.py", "--run_validators")
+                        val cmd = listOf("python", "-X", "utf8", "buildInrobics.py", "--run_validators")
                         val proc = ProcessBuilder(cmd)
                             .directory(File(basePath))
                             .redirectErrorStream(true)
+                            .apply {
+                                environment()["PYTHONUTF8"] = "1"
+                                environment()["PYTHONIOENCODING"] = "utf-8"
+                            }
                             .start()
-                        output = proc.inputStream.bufferedReader().readText()
+                        output = proc.inputStream.bufferedReader(Charsets.UTF_8).readText()
                         exitCode = proc.waitFor()
                     } catch (ex: Exception) {
                         output = ex.stackTraceToString()
